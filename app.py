@@ -125,6 +125,34 @@ def patient_picker(key):
     ids=[pid for pid,name in opts.items() if query.lower() in (pid+' '+name).lower()]
     if not ids: st.info('Nenhum paciente encontrado.');st.stop()
     return st.selectbox('Paciente',ids,format_func=lambda p:f'{opts[p]} — {p}',key=f'patient_{key}')
+def data_br(iso):
+    try: return datetime.strptime(str(iso), '%Y-%m-%d').strftime('%d/%m/%Y')
+    except (ValueError, TypeError): return str(iso)
+
+def numero_br(value):
+    if value is None: return '—'
+    try:
+        n=float(value)
+        if not (n == n and abs(n) != float('inf')): return '—'
+        txt=(f'{n:,.2f}'.rstrip('0').rstrip('.') if n != int(n) else f'{int(n):,}')
+        return txt.replace(',', '#').replace('.', ',').replace('#', '.')
+    except (ValueError, TypeError, OverflowError): return str(value)
+
+def resumo_tendencia(valores):
+    if len(valores)<2: return 'sem medições suficientes'
+    mudancas=[]
+    for a,b in zip(valores,valores[1:]):
+        if b>a: mudancas.append('aumento')
+        elif b<a: mudancas.append('redução')
+        else: mudancas.append('estabilidade')
+    if all(m == 'estabilidade' for m in mudancas): return 'estabilidade'
+    if 'aumento' in mudancas and 'redução' in mudancas:
+        if valores[-1]>valores[0]: saldo='aumento líquido'
+        elif valores[-1]<valores[0]: saldo='redução líquida'
+        else: saldo='sem variação líquida'
+        return 'oscilação (aumentou e diminuiu); '+saldo
+    return ('aumento' if valores[-1]>valores[0] else 'redução' if valores[-1]<valores[0] else 'estabilidade')
+
 def gerar_relatorio_pdf(nome, prontuario, registros, metricas, achados):
     """Gera relatório para impressão com os dados já conferidos na sessão."""
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
@@ -163,14 +191,14 @@ def gerar_relatorio_pdf(nome, prontuario, registros, metricas, achados):
         story.append(Paragraph('Resultados cronológicos' + (f' (parte {inicio//5+1})' if len(registros)>5 else ''), secao))
         header = [Paragraph('<b>Exame</b>', pequeno)]
         for r in bloco:
-            header.append(Paragraph('<b>'+escape(str(r['data']))+'</b>', pequeno))
+            header.append(Paragraph('<b>'+escape(data_br(r['data']))+'</b>', pequeno))
         linhas = [header]
         for metrica,(unidade,_) in metricas.items():
             valores=[r.get('valores',{}).get(metrica) for r in bloco]
             if not any(v is not None for v in valores):
                 continue
             row=[Paragraph(escape(metrica.capitalize()+' ('+unidade+')'), pequeno)]
-            row += [Paragraph('—' if v is None else escape(f'{v:g}' if isinstance(v,(int,float)) else str(v)), pequeno) for v in valores]
+            row += [Paragraph('—' if v is None else escape(numero_br(v)), pequeno) for v in valores]
             linhas.append(row)
         largura = 25.5*cm
         tabela = Table(linhas, colWidths=[6.5*cm]+[(largura-6.5*cm)/len(bloco)]*len(bloco), repeatRows=1, hAlign='LEFT')
@@ -188,11 +216,15 @@ def gerar_relatorio_pdf(nome, prontuario, registros, metricas, achados):
         obs=[(r['data'],r['valores'][metrica]) for r in registros if metrica in r.get('valores',{})]
         if len(obs)<2: continue
         tem_tendencia=True
-        vals=' → '.join(str(v) for _,v in obs)
-        direcao='aumento' if obs[-1][1]>obs[0][1] else 'redução' if obs[-1][1]<obs[0][1] else 'estabilidade'
+        vals=' → '.join(numero_br(v) for _,v in obs)
+        direcao=resumo_tendencia([v for _,v in obs])
         story.append(Paragraph('<b>'+escape(metrica.capitalize())+':</b> '+escape(vals)+' '+escape(unidade)+' — '+direcao, normal))
     if not tem_tendencia:
         story.append(Paragraph('Não há duas medições do mesmo parâmetro para calcular tendência.', normal))
+    story.append(Paragraph('Pontos que exigem conferência', secao))
+    if any((r.get('valores',{}).get('lactato') or 0) >= 4 for r in registros):
+        story.append(Paragraph('Há lactato igual ou superior a 4 mmol/L em pelo menos uma coleta. Verifique o valor e a data diretamente no laudo original; se confirmado em contexto clínico real, exige avaliação clínica imediata.', normal))
+    story.append(Paragraph('Os indicadores de alteração dependem do tipo de amostra e dos intervalos de referência do laboratório. Não há destaque automático de normalidade sem essa confirmação.', normal))
     story.append(Paragraph('Achados laboratoriais e hipóteses — não constituem diagnóstico', secao))
     exibidos=[a for a in achados if a.get('nivel')!='tendência']
     if not exibidos:
@@ -207,6 +239,7 @@ def gerar_relatorio_pdf(nome, prontuario, registros, metricas, achados):
     doc.build(story)
     buffer.seek(0)
     return buffer.getvalue()
+
 
 
 if page=='Pacientes':
@@ -269,7 +302,6 @@ elif page=='Enviar exame PDF':
                     existing.add(key); added+=1
             st.success(f'{added} PDF(s) adicionados à sessão. Faça backup JSON.')
 
-
 elif page=='Tendência':
     st.subheader('Tendência laboratorial cronológica — sem gráficos')
     pid=patient_picker('trend')
@@ -277,13 +309,13 @@ elif page=='Tendência':
     if not records: st.info('Nenhum exame salvo para este paciente.');st.stop()
     st.write(f'**{len(records)} arquivo(s)** | **{len(set(r["data"] for r in records))} data(s)**')
     # Colunas por exame preservam resultados distintos no mesmo dia.
-    labels=[f'{r["data"]} · {i+1}' for i,r in enumerate(records)]
+    labels=[f'{data_br(r["data"])} · {i+1}' for i,r in enumerate(records)]
     matrix=[]
     for metric,(unit,_) in METRICS.items():
         vals=[r['valores'].get(metric) for r in records]
         if any(v is not None for v in vals):
             row={'Exame':f'{metric.capitalize()} ({unit})'}
-            row.update({label:('—' if v is None else v) for label,v in zip(labels,vals)})
+            row.update({label:numero_br(v) for label,v in zip(labels,vals)})
             matrix.append(row)
     st.markdown('#### Resultados por data (do mais antigo ao mais recente)')
     st.dataframe(pd.DataFrame(matrix),hide_index=True,use_container_width=True)
@@ -293,11 +325,9 @@ elif page=='Tendência':
         obs=[(r['data'],r['valores'][metric]) for r in records if metric in r['valores']]
         if len(obs)<2: continue
         old,new=obs[0][1],obs[-1][1]
-        if new>old: direction='aumento'
-        elif new<old: direction='redução'
-        else: direction='estabilidade'
-        sequence=' → '.join(f'{v:g}' for _,v in obs)
-        st.write(f'**{metric.capitalize()}:** {sequence} {unit} — **{direction}** entre {obs[0][0]} e {obs[-1][0]}.')
+        direction=resumo_tendencia([v for _,v in obs])
+        sequence=' → '.join(numero_br(v) for _,v in obs)
+        st.write(f'**{metric.capitalize()}:** {sequence} {unit} — **{direction}** entre {data_br(obs[0][0])} e {data_br(obs[-1][0])}.')
     st.warning('As tendências descrevem variações numéricas, não determinam melhora, piora, diagnóstico ou conduta. Resultados dependem do contexto clínico e de intervalos de referência. Confira cada valor no laudo original.')
     st.markdown('#### Análise integrada — achados e hipóteses (não é diagnóstico)')
     st.info('Regras de triagem demonstrativas. Valores extraídos precisam ser conferidos. Os resultados de exames diferentes podem não ter sido coletados simultaneamente. Não substitui avaliação clínica.')
@@ -321,7 +351,7 @@ elif page=='Tendência':
     st.warning('Os valores de sódio e potássio da gasometria venosa não são incluídos como valores séricos. A correlação entre exames pode envolver datas diferentes; valide os resultados no laudo.')
     st.markdown('#### Arquivos incluídos')
     for i,r in enumerate(records):
-        with st.expander(f'{r["data"]} — {r["arquivo"]} (coluna {i+1})'):
+        with st.expander(f'{data_br(r["data"])} — {r["arquivo"]} (coluna {i+1})'):
             st.json(r['valores'])
 else:
     st.subheader('Backup e restauração')
