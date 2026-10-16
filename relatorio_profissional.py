@@ -38,7 +38,7 @@ def _sequence(obs):
     if all(m==0 for m in moves): return 'estável'
     if 1 in moves and -1 in moves:
         change='aumento' if vals[-1]>vals[0] else 'redução' if vals[-1]<vals[0] else 'sem variação'
-        return f'oscilou; {change} líquido(a) de {_br(abs(vals[-1]-vals[0]))}'
+        return ('oscilou; sem variação líquida' if change == 'sem variação' else f'oscilou; {change} {"líquido" if change == "aumento" else "líquida"} de {_br(abs(vals[-1]-vals[0]))}')
     return ('aumentou' if vals[-1]>vals[0] else 'reduziu') + f' {_br(abs(vals[-1]-vals[0]))}'
 
 
@@ -143,22 +143,28 @@ def gerar_relatorio_profissional(nome, prontuario, registros, metricas, achados)
     else:story.append(P('Sem duas medições comparáveis para calcular tendências.'))
     story.append(P('3. Síntese integrada da evolução','heading'))
     for item in _integrated(registros,metricas):story.append(P('• '+esc(item)))
-    story.append(P('4. Achados e hipóteses da triagem automática','heading'))
     visible=[a for a in achados if a.get('nivel')!='tendência']
-    if not visible:story.append(P('Nenhum achado sinalizado pelas regras disponíveis. Isso não exclui alterações.'))
-    for a in visible:
+    heading_achados=P('4. Achados e hipóteses da triagem automática','heading')
+    if not visible:
+        story.append(KeepTogether([heading_achados,P('Nenhum achado sinalizado pelas regras disponíveis. Isso não exclui alterações.')]))
+    for idx,a in enumerate(visible):
         lines=[P('<b>'+esc(a.get('titulo','Achado'))+'</b>')]
         for label,key in [('Evidência','evidencia'),('Hipótese','interpretacao'),('Conferir','verificar')]:
             if a.get(key):lines.append(P('<b>'+label+':</b> '+esc(a[key]),'small'))
-        story.append(KeepTogether(lines))
-    story.append(P('5. Alertas para conferência e limitações','heading'))
+        if idx == 0:
+            story.append(KeepTogether([heading_achados]+lines))
+        else:
+            story.append(KeepTogether(lines))
+    alert_heading=P('5. Alertas para conferência e limitações','heading')
+    alert_lines=[]
     for r in registros:
         lact=r.get('valores',{}).get('lactato')
         try:
             if lact is not None and float(lact)>=4:
-                story.append(P('<b>ATENÇÃO — Lactato de '+esc(_br(lact))+' mmol/L em '+esc(_date(r['data']))+'.</b> Conferir imediatamente no laudo original. Se confirmado em paciente real, requer avaliação clínica urgente.'))
+                alert_lines.append(P('<b>ATENÇÃO — Lactato de '+esc(_br(lact))+' mmol/L em '+esc(_date(r['data']))+'.</b> Conferir imediatamente no laudo original. Se confirmado em paciente real, requer avaliação clínica urgente.'))
         except (ValueError,TypeError):pass
-    story.append(P('A extração dos PDFs é experimental. Verifique identidade, data e hora de coleta, tipo de amostra, unidades, valores e referências antes de interpretar. Resultados de dias diferentes não são simultâneos. Não há inferência automática de causalidade, diagnóstico definitivo ou conduta.'))
+    story.append(KeepTogether([alert_heading]+alert_lines[:1]+[P('A extração dos PDFs é experimental. Verifique identidade, data e hora de coleta, tipo de amostra, unidades, valores e referências antes de interpretar. Resultados de dias diferentes não são simultâneos. Não há inferência automática de causalidade, diagnóstico definitivo ou conduta.')]))
+    story.extend(alert_lines[1:])
     story.append(P('<b>Fontes:</b> '+esc('; '.join(_date(r['data'])+' — '+str(r.get('arquivo','arquivo sem nome')) for r in registros)),'small'))
     doc.build(story,onFirstPage=footer,onLaterPages=footer)
     return buf.getvalue()
