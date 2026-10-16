@@ -23,19 +23,64 @@ if 'records' not in st.session_state: st.session_state.records=[]
 if st.sidebar.button('Sair'): st.session_state.logged=False;st.rerun()
 page=st.sidebar.radio('Menu',['Pacientes','Enviar exame PDF','Tendência','Backup / restaurar'])
 METRICS={'creatinina':('mg/dL','menor'), 'ureia':('mg/dL','menor'),'hemoglobina':('g/dL','contexto'),'leucócitos':('/mm³','contexto'),'plaquetas':('/mm³','contexto'),'lactato':('mmol/L','menor'),'sódio':('mEq/L','contexto'),'potássio':('mEq/L','contexto'),'magnésio':('mg/dL','contexto'),'pcr':('mg/L','menor'),'bicarbonato':('mmol/L','contexto'),'ph':('','contexto'),'pco2':('mmHg','contexto'),'glicose':('mg/dL','contexto'),'cálcio ionizado':('mmol/L','contexto')}
-PATTERNS={'creatinina':r'creatinina[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)','ureia':r'ureia[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)','hemoglobina':r'hemoglobinas?[^\n]{0,25}?([0-9]+[,.][0-9]+)','leucócitos':r'leucócitos[^\n]{0,65}?([0-9]{1,3}(?:\.[0-9]{3})+)','plaquetas':r'plaquetas[^\n]{0,25}?([0-9]{1,3}(?:\.[0-9]{3})+)','lactato':r'lactato[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)','sódio':r's[oó]dio[^\n]{0,45}?([0-9]+[,.][0-9]+)','potássio':r'pot[aá]ssio[^\n]{0,45}?([0-9]+[,.][0-9]+)','magnésio':r'magn[eé]sio[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)'}
+
+import unicodedata
+from datetime import datetime
+
+# Leitura conservadora: só usa linhas com resultado claramente associado ao exame.
+ALIASES = {
+    'creatinina': ['creatinina'], 'ureia': ['ureia'],
+    'hemoglobina': ['hemoglobina'], 'leucócitos': ['leucocitos', 'leucócitos'],
+    'plaquetas': ['plaquetas'], 'lactato': ['lactato'],
+    'sódio': ['sodio', 'sódio'], 'potássio': ['potassio', 'potássio'],
+    'magnésio': ['magnesio', 'magnésio'], 'pcr': ['proteina c reativa', 'proteína c reativa', 'pcr'],
+    'bicarbonato': ['bicarbonato', 'hco3'], 'ph': ['ph'],
+    'pco2': ['pco2'], 'glicose': ['glicose', 'glicemia'],
+    'cálcio ionizado': ['calcio ionizado', 'cálcio ionizado']
+}
+NUM = re.compile(r'(?<![\d/])\d{1,3}(?:\.\d{3})*(?:,\d+)?|\d+(?:\.\d+)?')
+DATE_RE = re.compile(r'(?:data\s+(?:da\s+)?coleta|coletad[oa]\s+em)\s*[:\-]?\s*(\d{2}[/-]\d{2}[/-]\d{4})', re.I)
+PATIENT_RE = re.compile(r'(?:nome\s+(?:do\s+)?paciente|paciente)\s*[:\-]\s*([^\n]+)', re.I)
+RECORD_RE = re.compile(r'(?:prontu[aá]rio|registro)\s*[:\-]\s*([A-Za-z0-9-]+)', re.I)
+
+def normalize(s):
+    return ''.join(c for c in unicodedata.normalize('NFKD', s.casefold()) if not unicodedata.combining(c))
+
+def number(s):
+    s=s.strip()
+    if ',' in s: s=s.replace('.','').replace(',','.')
+    return float(s)
+
 def parse_pdf(blob):
     with pdfplumber.open(io.BytesIO(blob)) as pdf:
-        text='\n'.join(page.extract_text() or '' for page in pdf.pages)
-    found={}
-    # Extraction is a draft, never assume accuracy; multiple values or page headers may interfere.
-    for metric,pat in PATTERNS.items():
-        m=re.search(pat,text,re.I)
-        if m:
-            raw=m.group(1).replace('.','').replace(',','.') if metric in ['leucócitos','plaquetas'] else m.group(1).replace(',','.')
-            try: found[metric]=float(raw)
-            except ValueError: pass
-    return found, bool(text.strip())
+        text='\n'.join(page.extract_text(layout=False) or '' for page in pdf.pages)
+    if not text.strip():
+        return {'error':'PDF sem texto pesquisável (digitalizado). Este protótipo não tem OCR.', 'values':{}}
+    dates=set()
+    for x in DATE_RE.findall(text):
+        try: dates.add(datetime.strptime(x.replace('-','/'),'%d/%m/%Y').date().isoformat())
+        except ValueError: pass
+    names=PATIENT_RE.findall(text)
+    records=RECORD_RE.findall(text)
+    results={}; ambiguous=set()
+    for line in text.splitlines():
+        simple=normalize(line).strip()
+        if not simple or any(x in simple for x in ['referencia', 'historico', 'anterior']):
+            continue
+        for metric,aliases in ALIASES.items():
+            if not any(re.match(r'^\s*'+re.escape(normalize(alias))+r'\b',simple) for alias in aliases):
+                continue
+            # Não confundir valores de referência, cabeçalhos, unidades ou datas.
+            m=re.match(r'^\s*[\wÀ-ÿ\s0-9()/-]+?\s*[:\-]?\s*(\d[\d.,]*)\s*(?:mg/dl|mmol/l|meq/l|g/dl|/mm3|/mm³|u/l|%|$)',line,re.I)
+            if not m: continue
+            try: value=number(m.group(1))
+            except ValueError: continue
+            if metric in results and results[metric]!=value: ambiguous.add(metric)
+            else: results[metric]=value
+    for metric in ambiguous: results.pop(metric,None)
+    return {'values':results,'ambiguous':sorted(ambiguous),'dates':sorted(dates),
+            'names':names,'records':records,'error':None}
+
 def patient_picker(key):
     opts=st.session_state.patients
     if not opts: st.info('Cadastre primeiro um paciente fictício.');st.stop()
@@ -53,50 +98,55 @@ if page=='Pacientes':
         else: st.session_state.patients[pid.strip()]=name.strip();st.success('Paciente cadastrado!')
     st.dataframe(pd.DataFrame([{'Nome':v,'Prontuário':k} for k,v in st.session_state.patients.items()]),hide_index=True,use_container_width=True)
 elif page=='Enviar exame PDF':
-    st.subheader('Enviar vários exames do mesmo paciente')
+    st.subheader('Leitura automática de múltiplos PDFs — DEMONSTRAÇÃO')
     pid=patient_picker('upload')
-    pdfs=st.file_uploader('Selecione vários PDFs fictícios (um por data)',type=['pdf'],accept_multiple_files=True)
+    patient_name=st.session_state.patients[pid]
+    st.caption('Sem digitação de resultados. O sistema bloqueia PDFs sem identidade e data verificáveis ou com extração insuficiente.')
+    pdfs=st.file_uploader('Selecione PDFs fictícios do MESMO paciente',type=['pdf'],accept_multiple_files=True)
     if pdfs:
-        st.info('Confira a DATA e TODOS os resultados de cada PDF. A leitura automática pode confundir valores e datas. PDFs digitalizados exigem digitação manual.')
-        drafts=[]
-        for idx,pdf in enumerate(pdfs):
-            with st.expander(f'📄 {pdf.name}',expanded=True):
-                if pdf.size>8_000_000:
-                    st.error('Arquivo maior que 8 MB.');continue
-                try:
-                    extracted,has_text=parse_pdf(pdf.getvalue())
-                except Exception:
-                    extracted,has_text={},False
-                if not has_text: st.warning('Sem texto extraível; preencha os resultados manualmente.')
-                # A data não é inferida do nome: exige confirmação do operador.
-                dt=st.date_input('Data da coleta deste PDF (confira no laudo)',value=date.today(),key=f'dt_{pid}_{idx}_{pdf.name}')
-                cols=st.columns(3)
-                raw={}
-                for j,(metric,(unit,_)) in enumerate(METRICS.items()):
-                    with cols[j%3]:
-                        raw[metric]=st.text_input(f'{metric.capitalize()} ({unit})',value=str(extracted.get(metric,'')),key=f'm_{pid}_{idx}_{pdf.name}_{metric}')
-                drafts.append((pdf.name,str(dt),raw))
-        if st.button('💾 Salvar todos os exames conferidos',type='primary'):
-            pending=[];errors=[]
-            for fname,dt,raw in drafts:
-                vals={}
-                for metric,v in raw.items():
-                    if v.strip():
-                        try: vals[metric]=float(v.strip().replace(',','.'))
-                        except ValueError: errors.append(f'{fname}: valor inválido para {metric}')
-                if not vals: errors.append(f'{fname}: informe pelo menos um resultado')
-                pending.append({'prontuario':pid,'data':dt,'arquivo':fname,'valores':vals})
-            if errors:
-                for err in errors: st.error(err)
-            else:
-                # Evita duplicar o mesmo PDF na mesma data em envios repetidos.
-                existing={(r['prontuario'],r['data'],r['arquivo']) for r in st.session_state.records}
-                added=0
-                for r in pending:
-                    key=(r['prontuario'],r['data'],r['arquivo'])
-                    if key not in existing:
-                        st.session_state.records.append(r);existing.add(key);added+=1
-                st.success(f'{added} exame(s) salvo(s) nesta sessão. Baixe o backup JSON para não perder os dados.')
+        pending=[]
+        for pdf in pdfs:
+            st.markdown(f'**📄 {pdf.name}**')
+            if pdf.size>8_000_000:
+                st.error('Arquivo acima de 8 MB.'); continue
+            try: data=parse_pdf(pdf.getvalue())
+            except Exception as exc:
+                st.error('Falha na leitura do PDF.'); continue
+            if data['error']:
+                st.error(data['error']); continue
+            if len(data['dates'])!=1:
+                st.error('Bloqueado: data de coleta ausente ou múltiplas datas de coleta no mesmo PDF.')
+                continue
+            names=[normalize(x).strip() for x in data['names']]
+            selected=normalize(patient_name).strip()
+            # Confirmação conservadora: o nome deve aparecer como identificação do paciente.
+            if not names or not any(x==selected or x.startswith(selected+' ') for x in names):
+                st.error('Bloqueado: nome do paciente não identificado ou diferente do cadastro.')
+                continue
+            if data['records'] and pid not in data['records']:
+                st.error('Bloqueado: prontuário do PDF diferente do cadastro.')
+                continue
+            if not data['values']:
+                st.error('Bloqueado: nenhum resultado extraído com segurança.'); continue
+            st.write('Data da coleta identificada:',data['dates'][0])
+            st.dataframe(pd.DataFrame([{'Exame':k,'Resultado':v,'Unidade':METRICS[k][0]}
+                                       for k,v in data['values'].items()]),hide_index=True)
+            if data['ambiguous']:
+                st.warning('Resultados conflitantes ignorados: '+', '.join(data['ambiguous']))
+            st.warning('Extração experimental: confira o PDF original. Resultados omitidos não são interpretados.')
+            pending.append({'prontuario':pid,'data':data['dates'][0],
+                            'arquivo':pdf.name,'hash':hashlib.sha256(pdf.getvalue()).hexdigest(),
+                            'valores':data['values']})
+        if pending and st.button('Salvar PDFs elegíveis (somente demonstração)',type='primary'):
+            existing={(r['prontuario'],r.get('hash',r['arquivo'])) for r in st.session_state.records}
+            added=0
+            for record in pending:
+                key=(record['prontuario'],record['hash'])
+                if key not in existing:
+                    st.session_state.records.append(record)
+                    existing.add(key); added+=1
+            st.success(f'{added} PDF(s) adicionados à sessão. Faça backup JSON.')
+
 elif page=='Tendência':
     st.subheader('Tendência laboratorial cronológica — sem gráficos')
     pid=patient_picker('trend')
