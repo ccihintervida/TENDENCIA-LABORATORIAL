@@ -40,7 +40,9 @@ ALIASES = {
     'cálcio ionizado': ['calcio ionizado', 'cálcio ionizado']
 }
 # Extrator para laudos textuais PCLAB. Não realiza OCR nem validação clínica.
-DATE_RE = re.compile(r"\bColeta\s*:\s*(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2})?", re.I)
+# Aceita "Coleta:", "Data da coleta:", "Dt. coleta:" e datas com traços.
+# Nunca utiliza data de liberação, cadastro, impressão ou nome do arquivo.
+DATE_RE = re.compile(r"(?i)\b(?:data\s+(?:da|de)\s+|dt\.?\s*)?coleta\s*[:\-]\s*(\d{2}[/-]\d{2}[/-]\d{4})(?:\s+\d{1,2}:\d{2})?")
 EXAM_RE = re.compile(r"(?im)^\s*Exame\s*:\s*([^\n]+)")
 PATIENT_RE = re.compile(r"(?im)^\s*Paciente\s*:\s*(.+?)\s+(?:Nasc\.\.|Nasc\.|Sexo\s*:|$)")
 PATIENT_CODE_RE = re.compile(r"(?im)C[oó]d\.\s*Pac\.\s*:\s*(\d+)")
@@ -73,14 +75,18 @@ def parse_pdf(blob):
         # Recorta no próximo cabeçalho de paciente para não carregar resultados da página seguinte.
         body=re.split(r'(?im)^\s*Dt\.\s*Cadastro\s*:',body)[0]
         entries.append((normalize(heading),body))
+    # Procura datas de coleta em TODO o PDF, inclusive em cabeçalhos e rodapés.
+    # Se houver coletas em dias distintos, bloqueia: um PDF pode conter várias amostras.
     dates=set()
-    for _,body in entries:
-        for d in DATE_RE.findall(body):
-            try: dates.add(datetime.strptime(d,'%d/%m/%Y').date().isoformat())
-            except ValueError: pass
+    for d in DATE_RE.findall(text):
+        try:
+            dates.add(datetime.strptime(d.replace('-', '/'), '%d/%m/%Y').date().isoformat())
+        except ValueError:
+            pass
     names=[normalize(x) for x in PATIENT_RE.findall(text)]
     codes=PATIENT_CODE_RE.findall(text)
     results={}; ambiguous=set(); evidence={}
+    is_culture = bool(re.search(r'(?i)hemocultura|cultura\s+de\s+sangue', text))
     # Só extrair a linha de resultado do exame correspondente; não ler referências nem histórico.
     simple_tests={
         'creatinina':'creatinina', 'ureia':'ureia', 'magnesio':'magnésio',
@@ -117,7 +123,7 @@ def parse_pdf(blob):
     for metric in ambiguous: results.pop(metric,None);evidence.pop(metric,None)
     return {'values':results,'ambiguous':sorted(ambiguous),'dates':sorted(dates),
             'names':names,'patient_codes':sorted(set(codes)),'records':[],
-            'evidence':evidence,'error':None}
+            'evidence':evidence,'is_culture':is_culture,'error':None}
 
 def patient_picker(key):
     opts=st.session_state.patients
@@ -269,8 +275,13 @@ elif page=='Enviar exame PDF':
                 st.error('Falha na leitura do PDF.'); continue
             if data['error']:
                 st.error(data['error']); continue
+            # Hemocultura não é um resultado numérico e exige um fluxo próprio.
+            # Não inventar data nem misturar culturas com a tendência de bioquímica.
+            if data.get('is_culture') and not data['values']:
+                st.warning('Hemocultura identificada. Este módulo ainda não interpreta culturas ou antibiogramas. O arquivo não será incluído na tendência numérica.')
+                continue
             if len(data['dates'])!=1:
-                st.error('Bloqueado: data de coleta ausente ou múltiplas datas de coleta no mesmo PDF.')
+                st.error('Bloqueado: não foi possível confirmar uma única data de coleta. Datas de impressão/liberação não são usadas; confira o laudo original.')
                 continue
             names=[normalize(x).strip() for x in data['names']]
             selected=normalize(patient_name).strip()
