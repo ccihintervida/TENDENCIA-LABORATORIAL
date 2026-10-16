@@ -125,6 +125,90 @@ def patient_picker(key):
     ids=[pid for pid,name in opts.items() if query.lower() in (pid+' '+name).lower()]
     if not ids: st.info('Nenhum paciente encontrado.');st.stop()
     return st.selectbox('Paciente',ids,format_func=lambda p:f'{opts[p]} — {p}',key=f'patient_{key}')
+def gerar_relatorio_pdf(nome, prontuario, registros, metricas, achados):
+    """Gera relatório para impressão com os dados já conferidos na sessão."""
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_CENTER
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.units import cm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from xml.sax.saxutils import escape
+    import os
+
+    buffer = io.BytesIO()
+    fonte = '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf'
+    negrito = '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+    if os.path.isfile(fonte) and 'DejaVuRel' not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont('DejaVuRel', fonte))
+        pdfmetrics.registerFont(TTFont('DejaVuRel-Bold', negrito))
+        pdfmetrics.registerFontFamily('DejaVuRel', normal='DejaVuRel', bold='DejaVuRel-Bold')
+    familia = 'DejaVuRel' if os.path.isfile(fonte) else 'Helvetica'
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle('NormalRel', parent=styles['Normal'], fontName=familia, fontSize=8.5, leading=12, spaceAfter=6)
+    titulo = ParagraphStyle('TituloRel', parent=normal, fontSize=16, leading=21, alignment=TA_CENTER, spaceAfter=14)
+    secao = ParagraphStyle('SecaoRel', parent=normal, fontSize=11, leading=15, spaceBefore=12, spaceAfter=8)
+    pequeno = ParagraphStyle('PequenoRel', parent=normal, fontSize=7, leading=10)
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4), rightMargin=1.3*cm, leftMargin=1.3*cm,
+                            topMargin=1.4*cm, bottomMargin=1.4*cm)
+    story = [Paragraph('RELATÓRIO DE TENDÊNCIA LABORATORIAL', titulo),
+             Paragraph('DEMONSTRAÇÃO — Dados fictícios/anonimizados. Não validado para uso clínico.', normal),
+             Paragraph('<b>Paciente:</b> ' + escape(str(nome)) + '    <b>Prontuário:</b> ' + escape(str(prontuario)), normal),
+             Paragraph(f'<b>Arquivos:</b> {len(registros)}    <b>Datas distintas:</b> {len(set(r["data"] for r in registros))}', normal)]
+    # Divide a tabela em blocos para manter as colunas legíveis na impressão.
+    for inicio in range(0, len(registros), 5):
+        bloco = registros[inicio:inicio+5]
+        story.append(Paragraph('Resultados cronológicos' + (f' (parte {inicio//5+1})' if len(registros)>5 else ''), secao))
+        header = [Paragraph('<b>Exame</b>', pequeno)]
+        for r in bloco:
+            header.append(Paragraph('<b>'+escape(str(r['data']))+'</b>', pequeno))
+        linhas = [header]
+        for metrica,(unidade,_) in metricas.items():
+            valores=[r.get('valores',{}).get(metrica) for r in bloco]
+            if not any(v is not None for v in valores):
+                continue
+            row=[Paragraph(escape(metrica.capitalize()+' ('+unidade+')'), pequeno)]
+            row += [Paragraph('—' if v is None else escape(f'{v:g}' if isinstance(v,(int,float)) else str(v)), pequeno) for v in valores]
+            linhas.append(row)
+        largura = 25.5*cm
+        tabela = Table(linhas, colWidths=[6.5*cm]+[(largura-6.5*cm)/len(bloco)]*len(bloco), repeatRows=1, hAlign='LEFT')
+        tabela.setStyle(TableStyle([
+            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#e8eef6')),
+            ('GRID',(0,0),(-1,-1),0.3,colors.HexColor('#cbd5e1')),
+            ('VALIGN',(0,0),(-1,-1),'TOP'),
+            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,colors.HexColor('#f8fafc')]),
+            ('LEFTPADDING',(0,0),(-1,-1),7),('RIGHTPADDING',(0,0),(-1,-1),7),
+        ]))
+        story.append(tabela)
+    story.append(Paragraph('Evolução numérica', secao))
+    tem_tendencia=False
+    for metrica,(unidade,_) in metricas.items():
+        obs=[(r['data'],r['valores'][metrica]) for r in registros if metrica in r.get('valores',{})]
+        if len(obs)<2: continue
+        tem_tendencia=True
+        vals=' → '.join(str(v) for _,v in obs)
+        direcao='aumento' if obs[-1][1]>obs[0][1] else 'redução' if obs[-1][1]<obs[0][1] else 'estabilidade'
+        story.append(Paragraph('<b>'+escape(metrica.capitalize())+':</b> '+escape(vals)+' '+escape(unidade)+' — '+direcao, normal))
+    if not tem_tendencia:
+        story.append(Paragraph('Não há duas medições do mesmo parâmetro para calcular tendência.', normal))
+    story.append(Paragraph('Achados laboratoriais e hipóteses — não constituem diagnóstico', secao))
+    exibidos=[a for a in achados if a.get('nivel')!='tendência']
+    if not exibidos:
+        story.append(Paragraph('Nenhum achado identificado pelas regras disponíveis.', normal))
+    for a in exibidos:
+        partes=[Paragraph('<b>'+escape(str(a.get('titulo','Achado')))+'</b>', normal)]
+        for rotulo,chave in [('Evidência','evidencia'),('Interpretação / hipótese','interpretacao'),('Conferir','verificar')]:
+            if a.get(chave): partes.append(Paragraph('<b>'+rotulo+':</b> '+escape(str(a[chave])), normal))
+        story.append(KeepTogether(partes))
+    story.append(Paragraph('Limitações: extração automática experimental. Confirme identidade, data, amostra, unidade e cada resultado no laudo original. Correlações não estabelecem causalidade. Não substitui avaliação profissional.', pequeno))
+    story.append(Paragraph('Arquivos utilizados: '+escape('; '.join(str(r.get('arquivo','')) for r in registros)), pequeno))
+    doc.build(story)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
 if page=='Pacientes':
     st.subheader('Cadastrar paciente fictício')
     with st.form('new'):
@@ -185,6 +269,7 @@ elif page=='Enviar exame PDF':
                     existing.add(key); added+=1
             st.success(f'{added} PDF(s) adicionados à sessão. Faça backup JSON.')
 
+
 elif page=='Tendência':
     st.subheader('Tendência laboratorial cronológica — sem gráficos')
     pid=patient_picker('trend')
@@ -217,6 +302,14 @@ elif page=='Tendência':
     st.markdown('#### Análise integrada — achados e hipóteses (não é diagnóstico)')
     st.info('Regras de triagem demonstrativas. Valores extraídos precisam ser conferidos. Os resultados de exames diferentes podem não ter sido coletados simultaneamente. Não substitui avaliação clínica.')
     findings=analyze(records)
+    try:
+        relatorio = gerar_relatorio_pdf(st.session_state.patients[pid], pid, records, METRICS, findings)
+        st.download_button('📄 Baixar relatório em PDF para imprimir', data=relatorio,
+                           file_name='relatorio_tendencia_'+re.sub(r'[^a-zA-Z0-9_-]','_',pid)+'.pdf',
+                           mime='application/pdf', type='primary')
+        st.caption('Abra o PDF baixado e pressione Ctrl + P para imprimir.')
+    except Exception:
+        st.error('Não foi possível gerar o PDF. Confira se reportlab está instalado nas dependências.')
     for item in findings:
         if item['nivel']=='tendência': continue
         with st.expander(f"{'⚠️' if item['nivel']=='prioritário' else '🔎'} {item['titulo']}", expanded=item['nivel']=='prioritário'):
