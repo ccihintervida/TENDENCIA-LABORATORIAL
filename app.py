@@ -38,48 +38,85 @@ ALIASES = {
     'pco2': ['pco2'], 'glicose': ['glicose', 'glicemia'],
     'cálcio ionizado': ['calcio ionizado', 'cálcio ionizado']
 }
-NUM = re.compile(r'(?<![\d/])\d{1,3}(?:\.\d{3})*(?:,\d+)?|\d+(?:\.\d+)?')
-DATE_RE = re.compile(r'(?:data\s+(?:da\s+)?coleta|coletad[oa]\s+em)\s*[:\-]?\s*(\d{2}[/-]\d{2}[/-]\d{4})', re.I)
-PATIENT_RE = re.compile(r'(?:nome\s+(?:do\s+)?paciente|paciente)\s*[:\-]\s*([^\n]+)', re.I)
-RECORD_RE = re.compile(r'(?:prontu[aá]rio|registro)\s*[:\-]\s*([A-Za-z0-9-]+)', re.I)
+# Extrator para laudos textuais PCLAB. Não realiza OCR nem validação clínica.
+DATE_RE = re.compile(r"\bColeta\s*:\s*(\d{2}/\d{2}/\d{4})(?:\s+\d{2}:\d{2})?", re.I)
+EXAM_RE = re.compile(r"(?im)^\s*Exame\s*:\s*([^\n]+)")
+PATIENT_RE = re.compile(r"(?im)^\s*Paciente\s*:\s*(.+?)\s+(?:Nasc\.\.|Nasc\.|Sexo\s*:|$)")
+PATIENT_CODE_RE = re.compile(r"(?im)C[oó]d\.\s*Pac\.\s*:\s*(\d+)")
 
 def normalize(s):
-    return ''.join(c for c in unicodedata.normalize('NFKD', s.casefold()) if not unicodedata.combining(c))
+    return ' '.join(''.join(c for c in unicodedata.normalize('NFKD', str(s).casefold()) if not unicodedata.combining(c)).split())
 
 def number(s):
     s=s.strip()
     if ',' in s: s=s.replace('.','').replace(',','.')
+    elif re.fullmatch(r'\d{1,3}(?:\.\d{3})+',s): s=s.replace('.','')
     return float(s)
+
+def find_result(block, pattern):
+    match=re.search(pattern, block, re.I | re.M)
+    return number(match.group(1)) if match else None
 
 def parse_pdf(blob):
     with pdfplumber.open(io.BytesIO(blob)) as pdf:
-        text='\n'.join(page.extract_text(layout=False) or '' for page in pdf.pages)
-    if not text.strip():
-        return {'error':'PDF sem texto pesquisável (digitalizado). Este protótipo não tem OCR.', 'values':{}}
+        pages=[page.extract_text(layout=False) or '' for page in pdf.pages]
+    if not any(p.strip() for p in pages):
+        return {'error':'PDF sem texto pesquisável. Esta demonstração não possui OCR.', 'values':{}}
+    text='\n'.join(pages)
+    # Cada página pode conter vários exames; separamos pelo título Exame.
+    pieces=re.split(r'(?im)^\s*Exame\s*:\s*', text)
+    entries=[]
+    for piece in pieces[1:]:
+        heading=re.split(r'\s+Id\s+Exame\s*:',piece.splitlines()[0],flags=re.I)[0].strip()
+        body='\n'.join(piece.splitlines()[1:])
+        # Recorta no próximo cabeçalho de paciente para não carregar resultados da página seguinte.
+        body=re.split(r'(?im)^\s*Dt\.\s*Cadastro\s*:',body)[0]
+        entries.append((normalize(heading),body))
     dates=set()
-    for x in DATE_RE.findall(text):
-        try: dates.add(datetime.strptime(x.replace('-','/'),'%d/%m/%Y').date().isoformat())
-        except ValueError: pass
-    names=PATIENT_RE.findall(text)
-    records=RECORD_RE.findall(text)
-    results={}; ambiguous=set()
-    for line in text.splitlines():
-        simple=normalize(line).strip()
-        if not simple or any(x in simple for x in ['referencia', 'historico', 'anterior']):
-            continue
-        for metric,aliases in ALIASES.items():
-            if not any(re.match(r'^\s*'+re.escape(normalize(alias))+r'\b',simple) for alias in aliases):
-                continue
-            # Não confundir valores de referência, cabeçalhos, unidades ou datas.
-            m=re.match(r'^\s*[\wÀ-ÿ\s0-9()/-]+?\s*[:\-]?\s*(\d[\d.,]*)\s*(?:mg/dl|mmol/l|meq/l|g/dl|/mm3|/mm³|u/l|%|$)',line,re.I)
-            if not m: continue
-            try: value=number(m.group(1))
-            except ValueError: continue
-            if metric in results and results[metric]!=value: ambiguous.add(metric)
-            else: results[metric]=value
-    for metric in ambiguous: results.pop(metric,None)
+    for _,body in entries:
+        for d in DATE_RE.findall(body):
+            try: dates.add(datetime.strptime(d,'%d/%m/%Y').date().isoformat())
+            except ValueError: pass
+    names=[normalize(x) for x in PATIENT_RE.findall(text)]
+    codes=PATIENT_CODE_RE.findall(text)
+    results={}; ambiguous=set(); evidence={}
+    # Só extrair a linha de resultado do exame correspondente; não ler referências nem histórico.
+    simple_tests={
+        'creatinina':'creatinina', 'ureia':'ureia', 'magnesio':'magnésio',
+        'potassio':'potássio', 'sodio':'sódio', 'lactato venoso':'lactato',
+        'proteina c reativa':'pcr', 'calcio ionico venoso':'cálcio ionizado',
+    }
+    result_pattern=r'(?im)^\s*(?:resultado|resultado\.{2,})\s*\.*\s*:\s*([0-9][0-9.,]*)\b'
+    # Hemograma usa uma linha com porcentagem antes da contagem absoluta.
+    hem_patterns={
+        'hemoglobina':r'(?im)^\s*Hemoglobinas?\.{2,}\s*:\s*([0-9][0-9.,]*)\s*g/dL',
+        'leucócitos':r'(?im)^\s*Leuc[oó]citos\.{2,}\s*:\s*\d+\s*%\s*([0-9][0-9.,]*)\s*/mm3',
+        'plaquetas':r'(?im)^\s*Plaquetas\.{2,}\s*:\s*([0-9][0-9.,]*)\s*/mm3',
+    }
+    gas_patterns={
+        'ph':r'(?im)^\s*pH\.{2,}\s*:\s*([0-9][0-9.,]*)',
+        'pco2':r'(?im)^\s*PCO2\.{2,}\s*:\s*([0-9][0-9.,]*)',
+        'bicarbonato':r'(?im)^\s*HC[O0]3\.{2,}\s*:\s*([0-9][0-9.,]*)',
+        'glicose':r'(?im)^\s*glicose\s*\.{2,}\s*:\s*([0-9][0-9.,]*)',
+    }
+    def add(metric,value,source):
+        if value is None: return
+        if metric in results and results[metric]!=value: ambiguous.add(metric)
+        else: results[metric]=value; evidence[metric]=source
+    for title,body in entries:
+        # Retirar rodapé e histórico, para não confundir valores anteriores.
+        body=re.split(r'(?im)^\s*Resultados anteriores\s*:',body)[0]
+        if title in simple_tests:
+            add(simple_tests[title],find_result(body,result_pattern),title)
+        elif title.startswith('hemograma'):
+            for metric,pattern in hem_patterns.items(): add(metric,find_result(body,pattern),title)
+        elif title.startswith('gasometria venosa'):
+            for metric,pattern in gas_patterns.items(): add(metric,find_result(body,pattern),title)
+            # Sódio/potássio da gasometria NÃO são misturados com resultados séricos.
+    for metric in ambiguous: results.pop(metric,None);evidence.pop(metric,None)
     return {'values':results,'ambiguous':sorted(ambiguous),'dates':sorted(dates),
-            'names':names,'records':records,'error':None}
+            'names':names,'patient_codes':sorted(set(codes)),'records':[],
+            'evidence':evidence,'error':None}
 
 def patient_picker(key):
     opts=st.session_state.patients
@@ -120,7 +157,7 @@ elif page=='Enviar exame PDF':
             names=[normalize(x).strip() for x in data['names']]
             selected=normalize(patient_name).strip()
             # Confirmação conservadora: o nome deve aparecer como identificação do paciente.
-            if not names or not any(x==selected or x.startswith(selected+' ') for x in names):
+            if not names or any(x != selected for x in names):
                 st.error('Bloqueado: nome do paciente não identificado ou diferente do cadastro.')
                 continue
             if data['records'] and pid not in data['records']:
@@ -129,6 +166,7 @@ elif page=='Enviar exame PDF':
             if not data['values']:
                 st.error('Bloqueado: nenhum resultado extraído com segurança.'); continue
             st.write('Data da coleta identificada:',data['dates'][0])
+            st.caption('O código do paciente do laboratório pode ser diferente do prontuário local. Confira a identidade no PDF antes de salvar.')
             st.dataframe(pd.DataFrame([{'Exame':k,'Resultado':v,'Unidade':METRICS[k][0]}
                                        for k,v in data['values'].items()]),hide_index=True)
             if data['ambiguous']:
@@ -187,7 +225,7 @@ elif page=='Tendência':
             if item['verificar']: st.write('**Conferir / informações faltantes:** '+item['verificar'])
     if not [x for x in findings if x['nivel']!='tendência']:
         st.info('Nenhum achado das regras disponíveis foi identificado; isso não exclui alterações ou doenças.')
-    st.warning('IMPORTANTE: não misture sódio/potássio séricos com valores da gasometria sem identificar o tipo de amostra. A versão demo não distingue automaticamente essas fontes. As correlações usam os valores mais recentes disponíveis, que podem ser de datas diferentes.')
+    st.warning('Os valores de sódio e potássio da gasometria venosa não são incluídos como valores séricos. A correlação entre exames pode envolver datas diferentes; valide os resultados no laudo.')
     st.markdown('#### Arquivos incluídos')
     for i,r in enumerate(records):
         with st.expander(f'{r["data"]} — {r["arquivo"]} (coluna {i+1})'):
