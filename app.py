@@ -1,5 +1,6 @@
 import streamlit as st
 from clinical_rules import analyze
+from relatorio_profissional import gerar_relatorio_profissional
 import pandas as pd
 import pdfplumber, io, re, json, hashlib, hmac
 from datetime import date, datetime
@@ -333,7 +334,7 @@ elif page=='Tendência':
     st.info('Regras de triagem demonstrativas. Valores extraídos precisam ser conferidos. Os resultados de exames diferentes podem não ter sido coletados simultaneamente. Não substitui avaliação clínica.')
     findings=analyze(records)
     try:
-        relatorio = gerar_relatorio_pdf(st.session_state.patients[pid], pid, records, METRICS, findings)
+        relatorio = gerar_relatorio_profissional(st.session_state.patients[pid], pid, records, METRICS, findings)
         st.download_button('📄 Baixar relatório em PDF para imprimir', data=relatorio,
                            file_name='relatorio_tendencia_'+re.sub(r'[^a-zA-Z0-9_-]','_',pid)+'.pdf',
                            mime='application/pdf', type='primary')
