@@ -1,4 +1,5 @@
 import streamlit as st
+from clinical_rules import analyze
 import pandas as pd
 import pdfplumber, io, re, json, hashlib, hmac
 from datetime import date, datetime
@@ -21,7 +22,7 @@ if 'patients' not in st.session_state: st.session_state.patients={}
 if 'records' not in st.session_state: st.session_state.records=[]
 if st.sidebar.button('Sair'): st.session_state.logged=False;st.rerun()
 page=st.sidebar.radio('Menu',['Pacientes','Enviar exame PDF','Tendência','Backup / restaurar'])
-METRICS={'creatinina':('mg/dL','menor'), 'ureia':('mg/dL','menor'),'hemoglobina':('g/dL','contexto'),'leucócitos':('/mm³','contexto'),'plaquetas':('/mm³','contexto'),'lactato':('mmol/L','menor'),'sódio':('mEq/L','contexto'),'potássio':('mEq/L','contexto'),'magnésio':('mg/dL','contexto'),'pcr':('mg/L','menor'),'bicarbonato':('mmol/L','contexto')}
+METRICS={'creatinina':('mg/dL','menor'), 'ureia':('mg/dL','menor'),'hemoglobina':('g/dL','contexto'),'leucócitos':('/mm³','contexto'),'plaquetas':('/mm³','contexto'),'lactato':('mmol/L','menor'),'sódio':('mEq/L','contexto'),'potássio':('mEq/L','contexto'),'magnésio':('mg/dL','contexto'),'pcr':('mg/L','menor'),'bicarbonato':('mmol/L','contexto'),'ph':('','contexto'),'pco2':('mmHg','contexto'),'glicose':('mg/dL','contexto'),'cálcio ionizado':('mmol/L','contexto')}
 PATTERNS={'creatinina':r'creatinina[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)','ureia':r'ureia[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)','hemoglobina':r'hemoglobinas?[^\n]{0,25}?([0-9]+[,.][0-9]+)','leucócitos':r'leucócitos[^\n]{0,65}?([0-9]{1,3}(?:\.[0-9]{3})+)','plaquetas':r'plaquetas[^\n]{0,25}?([0-9]{1,3}(?:\.[0-9]{3})+)','lactato':r'lactato[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)','sódio':r's[oó]dio[^\n]{0,45}?([0-9]+[,.][0-9]+)','potássio':r'pot[aá]ssio[^\n]{0,45}?([0-9]+[,.][0-9]+)','magnésio':r'magn[eé]sio[^\n]{0,100}?(?:resultado[^\n]{0,30}?)?([0-9]+[,.][0-9]+)'}
 def parse_pdf(blob):
     with pdfplumber.open(io.BytesIO(blob)) as pdf:
@@ -52,50 +53,95 @@ if page=='Pacientes':
         else: st.session_state.patients[pid.strip()]=name.strip();st.success('Paciente cadastrado!')
     st.dataframe(pd.DataFrame([{'Nome':v,'Prontuário':k} for k,v in st.session_state.patients.items()]),hide_index=True,use_container_width=True)
 elif page=='Enviar exame PDF':
-    st.subheader('Adicionar exame')
+    st.subheader('Enviar vários exames do mesmo paciente')
     pid=patient_picker('upload')
-    dt=st.date_input('Data da coleta',value=date.today())
-    pdf=st.file_uploader('Exame em PDF (apenas fictício)',type=['pdf'])
-    if pdf:
-        if pdf.size>8_000_000: st.error('PDF excede 8 MB.');st.stop()
-        try: extracted,has_text=parse_pdf(pdf.getvalue())
-        except Exception as e: st.error('Não foi possível ler o PDF. Use um PDF textual.');st.stop()
-        if not has_text: st.warning('PDF digitalizado sem texto. Digite os valores manualmente.')
-        st.info('Confira e corrija TODOS os valores antes de salvar. A extração automática pode errar.')
-        with st.form('confirm'):
-            values={}
-            for metric,(unit,_) in METRICS.items():
-                default=str(extracted[metric]) if metric in extracted else ''
-                value=st.text_input(f'{metric.capitalize()} ({unit})',value=default)
-                if value.strip():
-                    try: values[metric]=float(value.replace(',','.'))
-                    except ValueError: st.error(f'Valor inválido: {metric}')
-            ok=st.form_submit_button('Salvar resultados conferidos')
-        if ok:
-            if not values: st.error('Informe pelo menos um resultado.')
+    pdfs=st.file_uploader('Selecione vários PDFs fictícios (um por data)',type=['pdf'],accept_multiple_files=True)
+    if pdfs:
+        st.info('Confira a DATA e TODOS os resultados de cada PDF. A leitura automática pode confundir valores e datas. PDFs digitalizados exigem digitação manual.')
+        drafts=[]
+        for idx,pdf in enumerate(pdfs):
+            with st.expander(f'📄 {pdf.name}',expanded=True):
+                if pdf.size>8_000_000:
+                    st.error('Arquivo maior que 8 MB.');continue
+                try:
+                    extracted,has_text=parse_pdf(pdf.getvalue())
+                except Exception:
+                    extracted,has_text={},False
+                if not has_text: st.warning('Sem texto extraível; preencha os resultados manualmente.')
+                # A data não é inferida do nome: exige confirmação do operador.
+                dt=st.date_input('Data da coleta deste PDF (confira no laudo)',value=date.today(),key=f'dt_{pid}_{idx}_{pdf.name}')
+                cols=st.columns(3)
+                raw={}
+                for j,(metric,(unit,_)) in enumerate(METRICS.items()):
+                    with cols[j%3]:
+                        raw[metric]=st.text_input(f'{metric.capitalize()} ({unit})',value=str(extracted.get(metric,'')),key=f'm_{pid}_{idx}_{pdf.name}_{metric}')
+                drafts.append((pdf.name,str(dt),raw))
+        if st.button('💾 Salvar todos os exames conferidos',type='primary'):
+            pending=[];errors=[]
+            for fname,dt,raw in drafts:
+                vals={}
+                for metric,v in raw.items():
+                    if v.strip():
+                        try: vals[metric]=float(v.strip().replace(',','.'))
+                        except ValueError: errors.append(f'{fname}: valor inválido para {metric}')
+                if not vals: errors.append(f'{fname}: informe pelo menos um resultado')
+                pending.append({'prontuario':pid,'data':dt,'arquivo':fname,'valores':vals})
+            if errors:
+                for err in errors: st.error(err)
             else:
-                st.session_state.records.append({'prontuario':pid,'data':str(dt),'arquivo':pdf.name,'valores':values})
-                st.success('Resultados salvos nesta sessão. Faça backup para preservar os dados.')
+                # Evita duplicar o mesmo PDF na mesma data em envios repetidos.
+                existing={(r['prontuario'],r['data'],r['arquivo']) for r in st.session_state.records}
+                added=0
+                for r in pending:
+                    key=(r['prontuario'],r['data'],r['arquivo'])
+                    if key not in existing:
+                        st.session_state.records.append(r);existing.add(key);added+=1
+                st.success(f'{added} exame(s) salvo(s) nesta sessão. Baixe o backup JSON para não perder os dados.')
 elif page=='Tendência':
-    st.subheader('Comparação de exames')
+    st.subheader('Tendência laboratorial cronológica — sem gráficos')
     pid=patient_picker('trend')
-    records=sorted([r for r in st.session_state.records if r['prontuario']==pid],key=lambda r:r['data'])
+    records=sorted([r for r in st.session_state.records if r['prontuario']==pid],key=lambda r:(r['data'],r['arquivo']))
     if not records: st.info('Nenhum exame salvo para este paciente.');st.stop()
-    rows=[]
+    st.write(f'**{len(records)} arquivo(s)** | **{len(set(r["data"] for r in records))} data(s)**')
+    # Colunas por exame preservam resultados distintos no mesmo dia.
+    labels=[f'{r["data"]} · {i+1}' for i,r in enumerate(records)]
+    matrix=[]
+    for metric,(unit,_) in METRICS.items():
+        vals=[r['valores'].get(metric) for r in records]
+        if any(v is not None for v in vals):
+            row={'Exame':f'{metric.capitalize()} ({unit})'}
+            row.update({label:('—' if v is None else v) for label,v in zip(labels,vals)})
+            matrix.append(row)
+    st.markdown('#### Resultados por data (do mais antigo ao mais recente)')
+    st.dataframe(pd.DataFrame(matrix),hide_index=True,use_container_width=True)
+    st.caption('Colunas numeradas distinguem PDFs da mesma data. “—” significa resultado não informado, não valor zero.')
+    st.markdown('#### Interpretação descritiva das tendências')
     for metric,(unit,kind) in METRICS.items():
-        observations=[(r['data'],r['valores'][metric]) for r in records if metric in r['valores']]
-        if not observations: continue
-        first=observations[0]; last=observations[-1]
-        delta=last[1]-first[1]
-        trend='Estável' if abs(delta)<0.00001 else ('Aumentou' if delta>0 else 'Diminuiu')
-        rows.append({'Exame':metric.capitalize(),'Primeira data':first[0],'Primeiro valor':first[1],'Última data':last[0],'Último valor':last[1],'Unidade':unit,'Tendência':trend})
-    st.dataframe(pd.DataFrame(rows),hide_index=True,use_container_width=True)
-    st.caption('Aumento ou redução NÃO significa necessariamente melhora ou piora. A interpretação depende de referências, contexto clínico, método e unidade.')
-    st.subheader('Histórico por data')
-    for r in records:
-        with st.expander(f"{r['data']} — {r['arquivo']}"):
+        obs=[(r['data'],r['valores'][metric]) for r in records if metric in r['valores']]
+        if len(obs)<2: continue
+        old,new=obs[0][1],obs[-1][1]
+        if new>old: direction='aumento'
+        elif new<old: direction='redução'
+        else: direction='estabilidade'
+        sequence=' → '.join(f'{v:g}' for _,v in obs)
+        st.write(f'**{metric.capitalize()}:** {sequence} {unit} — **{direction}** entre {obs[0][0]} e {obs[-1][0]}.')
+    st.warning('As tendências descrevem variações numéricas, não determinam melhora, piora, diagnóstico ou conduta. Resultados dependem do contexto clínico e de intervalos de referência. Confira cada valor no laudo original.')
+    st.markdown('#### Análise integrada — achados e hipóteses (não é diagnóstico)')
+    st.info('Regras de triagem demonstrativas. Valores extraídos precisam ser conferidos. Os resultados de exames diferentes podem não ter sido coletados simultaneamente. Não substitui avaliação clínica.')
+    findings=analyze(records)
+    for item in findings:
+        if item['nivel']=='tendência': continue
+        with st.expander(f"{'⚠️' if item['nivel']=='prioritário' else '🔎'} {item['titulo']}", expanded=item['nivel']=='prioritário'):
+            st.write('**Evidência:** '+item['evidencia'])
+            st.write('**Interpretação / hipótese:** '+item['interpretacao'])
+            if item['verificar']: st.write('**Conferir / informações faltantes:** '+item['verificar'])
+    if not [x for x in findings if x['nivel']!='tendência']:
+        st.info('Nenhum achado das regras disponíveis foi identificado; isso não exclui alterações ou doenças.')
+    st.warning('IMPORTANTE: não misture sódio/potássio séricos com valores da gasometria sem identificar o tipo de amostra. A versão demo não distingue automaticamente essas fontes. As correlações usam os valores mais recentes disponíveis, que podem ser de datas diferentes.')
+    st.markdown('#### Arquivos incluídos')
+    for i,r in enumerate(records):
+        with st.expander(f'{r["data"]} — {r["arquivo"]} (coluna {i+1})'):
             st.json(r['valores'])
-    st.warning('Este protótipo não fornece diagnóstico nem decisão terapêutica. Confira os laudos originais e consulte o profissional responsável.')
 else:
     st.subheader('Backup e restauração')
     st.error('Os dados desta demonstração ficam na sessão e podem desaparecer ao reiniciar o aplicativo. Baixe o backup após cada uso.')
